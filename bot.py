@@ -10,6 +10,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, filters, ContextTypes
 )
+from telegram.request import HTTPXRequest
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -28,7 +29,7 @@ FINAL_PHOTO = os.environ.get("FINAL_PHOTO", "")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== DATABASE (same as before) ==========
+# ========== DATABASE ==========
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -94,7 +95,6 @@ async def safe_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text, **
 
     try:
         if last_msg_id:
-            # Try to edit the previous bot message
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=last_msg_id,
@@ -104,15 +104,13 @@ async def safe_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text, **
             return
     except Exception as e:
         logger.warning(f"Edit failed: {e}. Sending new message instead.")
-        # If edit fails (e.g., message deleted), send new
-        pass
 
-    # Send new message
+    # Send new message and store its ID
     msg = await update.effective_message.reply_text(text, **kwargs)
     context.user_data["last_bot_msg_id"] = msg.message_id
 
 async def safe_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, photo, caption, **kwargs):
-    """Send a photo and store its message ID, deleting the previous if exists."""
+    """Send a photo, deleting previous bot message to keep chat clean."""
     chat_id = update.effective_chat.id
     last_msg_id = context.user_data.get("last_bot_msg_id")
     if last_msg_id:
@@ -196,12 +194,11 @@ async def country_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     country = country_map.get(query.data, "Other")
     save_field(query.from_user.id, 'country', country)
-    # Convert callback query to a pseudo-update for safe_edit
+    # Create a fake update for safe_edit
     class FakeUpdate:
         effective_chat = query.message.chat
         effective_message = query.message
-    fake = FakeUpdate()
-    await ask_city(fake, context)
+    await ask_city(FakeUpdate(), context)
     return CITY
 
 async def ask_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,8 +240,7 @@ async def funding_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     class FakeUpdate:
         effective_chat = query.message.chat
         effective_message = query.message
-    fake = FakeUpdate()
-    await ask_player_id(fake, context)
+    await ask_player_id(FakeUpdate(), context)
     return PLAYER_ID
 
 async def ask_player_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -319,16 +315,40 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await safe_edit(query, context, "✅ *APPLICATION SUBMITTED!*\n\nAdmin will review within 24h.\nUse /start to check status.", parse_mode='Markdown')
 
-    # Notify admins (simplified)
+    # Notify admins
     admin_msg = f"🆕 New agent: {data.get('full_name')} (ID: {user_id})"
     for aid in ADMIN_IDS:
         await context.bot.send_message(aid, admin_msg)
     return ConversationHandler.END
 
-# ========== MAIN ==========
+async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = get_user(user_id)
+    if not data:
+        await update.message.reply_text("No application. Send /start")
+        return
+    status_map = {
+        'pending': "⏳ Application in progress.",
+        'pending_admin_review': "⏳ Under review (24h).",
+        'approved_id': "✅ Player ID approved. Please make prepayment.",
+        'prepayment_received': "💰 Prepayment received, admin verifying.",
+        'completed': "🎉 You are an official agent!"
+    }
+    await update.message.reply_text(status_map.get(data.get('status'), "Unknown status"), parse_mode='Markdown')
+
+# ========== MAIN WITH HIGHER TIMEOUTS ==========
 def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Create a custom request with longer timeouts (fixes Heroku timeouts)
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0
+    )
+
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
@@ -346,8 +366,16 @@ def main():
         fallbacks=[CommandHandler('start', start)]
     )
     app.add_handler(conv)
-    logger.info("Bot started - should now respond after each input")
-    app.run_polling()
+    app.add_handler(CommandHandler('check_status', check_status))
+
+    logger.info("Bot started with extended timeouts – should stay alive on Heroku")
+
+    # Run polling with a custom read timeout for getUpdates
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # avoids old updates causing timeouts
+        read_timeout=30
+    )
 
 if __name__ == '__main__':
     main()
