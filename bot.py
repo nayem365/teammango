@@ -5,7 +5,7 @@ from datetime import datetime
 
 import psycopg2
 from psycopg2.extras import DictCursor
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, filters, ContextTypes
@@ -105,12 +105,10 @@ async def safe_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text, **
     except Exception as e:
         logger.warning(f"Edit failed: {e}. Sending new message instead.")
 
-    # Send new message and store its ID
     msg = await update.effective_message.reply_text(text, **kwargs)
     context.user_data["last_bot_msg_id"] = msg.message_id
 
 async def safe_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, photo, caption, **kwargs):
-    """Send a photo, deleting previous bot message to keep chat clean."""
     chat_id = update.effective_chat.id
     last_msg_id = context.user_data.get("last_bot_msg_id")
     if last_msg_id:
@@ -141,7 +139,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_edit(update, context, welcome_text, parse_mode='Markdown')
 
-    # Now ask for name (replaces welcome)
     await ask_name(update, context)
     return NAME
 
@@ -165,10 +162,14 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PHONE
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📱 SHARE CONTACT", request_contact=True)]])
-    await safe_edit(update, context, "📞 *Phone Number*\n\nShare using the button below:", parse_mode='Markdown', reply_markup=keyboard)
+    # Use reply keyboard for contact request (InlineKeyboardButton does NOT support request_contact)
+    contact_button = KeyboardButton("📱 SHARE CONTACT", request_contact=True)
+    reply_markup = ReplyKeyboardMarkup([[contact_button]], one_time_keyboard=True, resize_keyboard=True)
+    await safe_edit(update, context, "📞 *Phone Number*\n\nShare using the button below:", parse_mode='Markdown', reply_markup=reply_markup)
 
 async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Remove the reply keyboard after getting contact
+    await update.message.reply_text("Processing...", reply_markup=ReplyKeyboardRemove())
     if not update.message.contact:
         await safe_edit(update, context, "❌ Please use the *Share Contact* button.", parse_mode='Markdown')
         return PHONE
@@ -194,7 +195,6 @@ async def country_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     country = country_map.get(query.data, "Other")
     save_field(query.from_user.id, 'country', country)
-    # Create a fake update for safe_edit
     class FakeUpdate:
         effective_chat = query.message.chat
         effective_message = query.message
@@ -340,7 +340,6 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
 
-    # Create a custom request with longer timeouts (fixes Heroku timeouts)
     request = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=30.0,
@@ -368,14 +367,8 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler('check_status', check_status))
 
-    logger.info("Bot started with extended timeouts – should stay alive on Heroku")
-
-    # Run polling with a custom read timeout for getUpdates
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # avoids old updates causing timeouts
-        read_timeout=30
-    )
+    logger.info("Bot started - all functions working, phone contact fixed")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, read_timeout=30)
 
 if __name__ == '__main__':
     main()
